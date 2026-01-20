@@ -3,8 +3,28 @@ import viktor as vkt
 from typing import Any
 from aps_viewer_sdk import APSViewer
 from aps_viewer_sdk.helper import get_all_model_properties, get_metadata_viewables
+from aps_viewer_sdk.client import ElementsInScene
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+
+
+# Hardcoded property options based on Plant 3D element properties
+PROPERTY_OPTIONS = [
+    "Description",
+    "Status", 
+    "Tag",
+    "Size",
+    "Spec",
+    "Service",
+    "Insulation Thickness",
+    "Type",
+    "Number",
+    "Capacity",
+    "PnPID",
+    "PnPGuid",
+    "Class Name",
+    "Manufacturer",
+]
 
 
 def to_md_urn(value: str) -> str:
@@ -167,6 +187,19 @@ def get_class_name_counts_cached(*, token: str, urn_bs64: str, model_guid: str) 
 
 
 @vkt.memoize
+def get_properties_payload_cached(*, token: str, urn_bs64: str, model_guid: str) -> dict[str, Any]:
+    """
+    Cached function to get all model properties payload.
+    This is memoized to avoid repeated API calls for the same model.
+    """
+    return get_all_model_properties(
+        token=token,
+        urn_bs64=urn_bs64,
+        model_guid=model_guid
+    )
+
+
+@vkt.memoize
 def get_metadata_views_cached(*, token: str, urn_bs64: str) -> list[dict[str, Any]]:
     """
     Cached function to get metadata viewables.
@@ -256,10 +289,49 @@ def get_tag_options(params, **kwargs):
     return options
 
 
+def get_class_name_options(params, **kwargs):
+    """Gets option list elements for Class Names from the selected view"""
+    autodesk_file = params.autodesk_file
+    if not autodesk_file:
+        return []
+    
+    selected_guid = params.selected_view
+    if not selected_guid:
+        return []
+
+    integration = vkt.external.OAuth2Integration("aps-integration-viktor")
+    token = integration.get_access_token()
+    version = autodesk_file.get_latest_version(token)
+    version_urn = version.urn
+    urn_bs64 = to_md_urn(version_urn)
+    
+    # Get cached class name counts
+    class_counts = get_class_name_counts_cached(
+        token=token,
+        urn_bs64=urn_bs64,
+        model_guid=selected_guid
+    )
+    
+    if not class_counts:
+        return []
+    
+    # Sort by count descending and format nicely
+    sorted_items = sorted(class_counts.items(), key=lambda x: x[1], reverse=True)
+    options = []
+    for class_name, count in sorted_items:
+        display_name = class_name.replace('_', ' ')
+        options.append(vkt.OptionListElement(
+            label=f"{display_name} ({count})", 
+            value=class_name
+        ))
+    
+    return options
+
+
 class Parametrization(vkt.Parametrization):
     title = vkt.Text("""# Plant 3D - Integration
-This application allows users to view Plant 3D models and explore PID tags and their properties.
-Select a Plant 3D model, choose a viewable, and configure tag parameters.
+This application allows users to view Plant 3D models, explore PID tags, and perform QA/QC checks.
+Select a Plant 3D model, choose a viewable, and configure filters to highlight elements.
     """)
     
     header1 = vkt.Text("""## 1. Select Plant 3D Model""")
@@ -273,11 +345,15 @@ Select a Plant 3D model, choose a viewable, and configure tag parameters.
     selected_view = vkt.OptionField("Select Plant3D Viewable", options=get_viewables)
     
     lbk1 = vkt.LineBreak()
-    header3 = vkt.Text("""## 3. Configure Tag Parameters""")
-    tag_params = vkt.DynamicArray("Tag Parameters", row_label="Tag", copylast=True)
-    tag_params.tag = vkt.OptionField("PID Tag", options=get_tag_options)
-    tag_params.param_name = vkt.TextField("Parameter Name")
-    tag_params.value = vkt.TextField("Value")
+    header3 = vkt.Text("""## 3. QA/QC Filter Configuration
+Configure filters to highlight elements in the QA/QC view. Each filter row will be highlighted with the selected color.
+Select multiple Class Names per row if needed.
+    """)
+    qc_filters = vkt.DynamicArray("QA/QC Filters", row_label="Filter", copylast=True)
+    qc_filters.class_names = vkt.MultiSelectField("Class Names", options=get_class_name_options)
+    qc_filters.property_name = vkt.OptionField("Property", options=PROPERTY_OPTIONS)
+    qc_filters.expected_value = vkt.TextField("Expected Value (leave empty to match any)")
+    qc_filters.highlight_color = vkt.ColorField("Highlight Color", default=vkt.Color.blue())
 
 
 class Controller(vkt.Controller):
@@ -296,7 +372,7 @@ class Controller(vkt.Controller):
         viewer = APSViewer(urn=version_urn, token=token)
         html = viewer.write()
         return vkt.WebResult(html=html)
-    
+
     @vkt.PlotlyView("Quantity Takeoff", duration_guess=30)
     def quantity_takeoff_view(self, params, **kwargs) -> vkt.PlotlyResult:
         """Combined pie chart and bar chart showing PID elements grouped by Class Name."""
@@ -446,40 +522,142 @@ class Controller(vkt.Controller):
         )
         
         return vkt.PlotlyResult(fig)
+
     
-    def build_tag_properties_dict(self, params, **kwargs) -> dict[str, Any]:
-        """Convert dynamic array into structured properties dictionary"""
-        tag_params = params.tag_params
-        if not tag_params:
-            return {"version": 1, "items": []}
+    @vkt.WebView("QA/QC View", duration_guess=30)
+    def qaqc_view(self, params, **kwargs) -> vkt.WebResult:
+        """QA/QC view that highlights elements based on filter criteria."""
+        autodesk_file = params.autodesk_file
+        selected_guid = params.selected_view
         
-        # Group parameters by tag
-        tag_groups: dict[str, dict[str, str]] = {}
-        for row in tag_params:
-            tag = row.get("tag")
-            param_name = row.get("param_name")
-            value = row.get("value")
-            
-            # Skip incomplete rows
-            if not tag or not param_name or not value:
+        if not autodesk_file:
+            return vkt.WebResult(html="<p>Please select a Plant 3D file.</p>")
+        
+        if not selected_guid:
+            return vkt.WebResult(html="<p>Please select a viewable.</p>")
+
+        integration = vkt.external.OAuth2Integration("aps-integration-viktor")
+        token = integration.get_access_token()
+        version = autodesk_file.get_latest_version(token)
+        version_urn = version.urn
+        urn_bs64 = to_md_urn(version_urn)
+        
+        # Create viewer
+        viewer = APSViewer(urn=version_urn, token=token)
+        
+        # Get viewables and set the selected view
+        viewables = viewer.get_viewables(urn_bs64)
+        if viewables:
+            selected_viewable = next(
+                (v for v in viewables if v.get("guid") == selected_guid),
+                viewables[0]
+            )
+            viewer.set_view_guid(
+                selected_viewable["guid"],
+                selected_viewable.get("name", "View"),
+                selected_viewable.get("role", "3d")
+            )
+        
+        # Parse filters from params
+        qc_filters = params.qc_filters or []
+        
+        # If no filters, show viewer without highlighting
+        if not qc_filters or all(not f.get("class_names") for f in qc_filters):
+            html = viewer.write()
+            return vkt.WebResult(html=html)
+        
+        # Get properties payload
+        properties_payload = get_properties_payload_cached(
+            token=token,
+            urn_bs64=urn_bs64,
+            model_guid=selected_guid
+        )
+        
+        data = properties_payload.get("data", {})
+        collection = data.get("collection", [])
+        
+        # Default color if none specified
+        default_color = "#FF0000"
+        
+        # Build filter criteria with colors from user selection
+        filter_criteria = []
+        for idx, f in enumerate(qc_filters):
+            class_names = f.get("class_names") or []
+            if not class_names:
                 continue
             
-            # Initialize tag group if not exists
-            if tag not in tag_groups:
-                tag_groups[tag] = {}
+            # Get color from user selection, use default if not set
+            user_color = f.get("highlight_color")
+            if user_color:
+                color_hex = user_color.hex
+            else:
+                color_hex = default_color
             
-            # Add parameter to the tag's properties
-            tag_groups[tag][param_name] = value
-        
-        # Build the final structure
-        items = []
-        for tag, properties in tag_groups.items():
-            items.append({
-                "match": {"tag": tag},
-                "properties": properties
+            filter_criteria.append({
+                "class_names": class_names,
+                "property_name": f.get("property_name"),
+                "expected_value": (f.get("expected_value") or "").strip(),
+                "color": color_hex
             })
         
-        return {
-            "version": 1,
-            "items": items
-        }
+        if not filter_criteria:
+            html = viewer.write()
+            return vkt.WebResult(html=html)
+        
+        # Find matching elements
+        highlight_elements: list[ElementsInScene] = []
+        
+        for obj in collection:
+            if not isinstance(obj, dict):
+                continue
+            
+            obj_props = obj.get("properties")
+            if not isinstance(obj_props, dict):
+                continue
+            
+            external_id = obj.get("externalId")
+            if not external_id:
+                continue
+            
+            # Get element's class name
+            obj_class_name = find_prop_any_group(obj_props, "Class Name")
+            if obj_class_name is None:
+                continue
+            
+            # Check if element matches any filter
+            for criteria in filter_criteria:
+                # Check if class name is in the selected class names
+                if obj_class_name not in criteria["class_names"]:
+                    continue
+                
+                # If property name is specified, check property match
+                prop_name = criteria.get("property_name")
+                expected_val = criteria.get("expected_value")
+                
+                if prop_name and expected_val:
+                    # Check if property matches expected value
+                    actual_val = find_prop_any_group(obj_props, prop_name)
+                    if actual_val is None:
+                        continue
+                    if str(actual_val).strip().lower() != expected_val.lower():
+                        continue
+                elif prop_name and not expected_val:
+                    # Property specified but no value - just check if property exists
+                    actual_val = find_prop_any_group(obj_props, prop_name)
+                    if actual_val is None:
+                        continue
+                
+                # Element matches - highlight it with this filter's color
+                highlight_elements.append({
+                    "externalElementId": external_id,
+                    "color": criteria["color"]
+                })
+                break  # Element matched, use first matching filter's color
+        
+        # Apply highlighting
+        if highlight_elements:
+            viewer.highlight_elements(highlight_elements)
+        
+        html = viewer.write()
+        return vkt.WebResult(html=html)
+    
