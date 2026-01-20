@@ -1,0 +1,7 @@
+app_type = "simple"
+python_version = "3.14"
+registered_name = "plant3d-model-derivative"
+oauth2_integrations = [
+  "aps-integration-viktor"
+]
+
